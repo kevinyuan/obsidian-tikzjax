@@ -48,10 +48,12 @@ export class TikzjaxSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('Clear cached SVGs')
 			.setDesc('SVGs rendered with TikZJax are stored in a database, so diagrams don\'t have to be re-rendered from scratch every time you open a page. Use this to clear the cache and force all diagrams to be re-rendered.')
-			.addButton(button => button
-				.setIcon("trash")
-				.setTooltip("Clear cached SVGs")
-				.onClick(async () => {
+			.addButton(button => {
+				button.setIcon("trash")
+					.setButtonText("Clear cache")
+					.setWarning()
+					.setTooltip("Clear cached SVGs");
+				button.onClick(async () => {
 					localForage.clear((err) => {
 						if (err) {
 							console.log(err);
@@ -61,6 +63,7 @@ export class TikzjaxSettingTab extends PluginSettingTab {
 							new Notice("TikZJax: Successfully cleared cached SVGs.", 3000);
 						}
 					});
-				}));
+				});
+			});
 	}
 }

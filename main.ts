@@ -5,11 +5,12 @@ import { optimize } from "./svgo.browser";
 // @ts-ignore
 import tikzjaxJs from 'inline:./tikzjax.js';
 
-const RENDER_TIMEOUT_MS = 30000;
+const RENDER_TIMEOUT_MS = 15000;
 
 export default class TikzjaxPlugin extends Plugin {
 	settings: TikzjaxPluginSettings;
 	private initializedDocs = new WeakSet<Document>();
+	private svgCache = new Map<string, string>();
 
 	async onload() {
 		await this.loadSettings();
@@ -43,9 +44,10 @@ export default class TikzjaxPlugin extends Plugin {
 	}
 
 
-	// Patch tikzjax.js to add a timeout to the TeX Worker compilation.
-	// Without this, a single hung texify() call blocks the serial render queue
-	// forever, causing all subsequent diagrams to show a spinner indefinitely.
+	// Patch tikzjax.js to:
+	// 1. Add a timeout to the TeX Worker compilation
+	// 2. Expose a cleanup function for full engine reset
+	// 3. Replace broken-image error with visible error message
 	patchTikZJaxJs(js: string): string {
 		// 1. Wrap H.texify() with Promise.race + timeout so a hung Worker
 		//    rejects after RENDER_TIMEOUT_MS instead of waiting forever
@@ -61,7 +63,22 @@ export default class TikzjaxPlugin extends Plugin {
 
 		js = js.replace(texifyOriginal, texifyPatched);
 
-		// 2. Replace the broken-image error indicator with a visible error message
+		// 2. Expose a cleanup function so the plugin can terminate the Worker
+		//    and disconnect the MutationObserver for a full engine reset
+		const initOriginal = 'window.TikzJax=!0,P().config';
+		const initPatched = 'window.TikzJax=!0,window.__tikzjaxCleanup=async function(){' +
+			'try{u&&u.disconnect()}catch(x){}' +
+			'try{var W=await H;await e.terminate(W)}catch(x){}' +
+			'window.TikzJax=!1' +
+			'},P().config';
+
+		if (js.indexOf(initOriginal) === -1) {
+			console.warn('TikZJax: could not find init site to patch — reset will not be available');
+		} else {
+			js = js.replace(initOriginal, initPatched);
+		}
+
+		// 3. Replace the broken-image error indicator with a visible error message
 		const errorOriginal = "q.outerHTML=\"<img src='//invalid.site/img-not-found.png'/>\"";
 		const errorPatched = 'q.outerHTML="<div style=\\"color:var(--text-error);' +
 			'padding:8px 12px;border:1px solid var(--text-error);border-radius:4px;' +
@@ -140,47 +157,91 @@ export default class TikzjaxPlugin extends Plugin {
 
 			const tidiedSource = this.tidyTikzSource(source);
 
+			// Use cached SVG if available — critical for PDF export, where each
+			// diagram is re-rendered in a fresh document and the async tikzjax
+			// Worker may not finish before the PDF is captured.
+			const cached = this.svgCache.get(tidiedSource);
+			if (cached) {
+				el.innerHTML = cached;
+				return;
+			}
+
+			// Mark the container so postProcessSvg can store the result.
+			el.dataset.tikzSource = tidiedSource;
+
 			const script = el.createEl("script");
 			script.setAttribute("type", "text/tikz");
 			script.setAttribute("data-show-console", "true");
 			script.setText(tidiedSource);
 
-			// Watch for stuck renders and retry once if the spinner is still
-			// showing after the timeout. This handles the case where the
-			// Worker completed the timed-out request and is available again.
+			// Watch for stuck renders — if the spinner is still showing after
+			// the timeout, show an error with a retry button that does a
+			// full engine reset (terminates Worker, re-injects tikzjax.js).
 			this.watchForStuckRender(el, tidiedSource);
 		});
 	}
 
-	watchForStuckRender(el: HTMLElement, source: string, retried = false) {
+	watchForStuckRender(el: HTMLElement, source: string) {
 		const timeoutId = window.setTimeout(() => {
 			if (!el.isConnected) return;
 
+			// Check if still showing a spinner (SVG with <animate>) or
+			// if tikzjax never even started (script element still present)
 			const svg = el.querySelector('svg');
-			if (!svg) return;
+			const script = el.querySelector('script[type="text/tikz"]');
+			const isStuck = script !== null || (svg !== null && svg.querySelector('animate') !== null);
+			if (!isStuck) return;
 
-			// A spinner SVG contains <animate> elements; a rendered diagram does not
-			const isSpinner = svg.querySelector('animate') !== null;
-			if (!isSpinner) return;
-
-			if (!retried) {
-				// First timeout — replace the stuck spinner with a fresh script
-				// element so the MutationObserver in tikzjax.js picks it up again
-				console.log('TikZJax: render appears stuck, retrying...');
-				const script = el.createEl("script");
-				script.setAttribute("type", "text/tikz");
-				script.setAttribute("data-show-console", "true");
-				script.setText(source);
-				svg.replaceWith(script);
-
-				this.watchForStuckRender(el, source, true);
-			}
-			// After retry timeout, the tikzjax.js timeout patch will have
-			// already replaced the spinner with an error message, so we
-			// don't need further action here.
+			console.log('TikZJax: render appears stuck, performing full engine reset...');
+			this.showRetryable(el, source, 'Render timed out');
 		}, RENDER_TIMEOUT_MS + 2000); // slightly after the inner timeout
 
 		this.register(() => clearTimeout(timeoutId));
+	}
+
+	showRetryable(el: HTMLElement, source: string, reason: string) {
+		const doc = el.ownerDocument;
+		el.empty();
+
+		const errorDiv = el.createEl("div", { cls: "tikz-error" });
+		errorDiv.createEl("span", { text: `TikZJax: ${reason}` });
+		const retryBtn = errorDiv.createEl("button", {
+			text: "Retry",
+			cls: "tikz-retry-btn",
+		});
+		retryBtn.addEventListener("click", async () => {
+			errorDiv.remove();
+			await this.resetTikZJaxEngine(doc);
+
+			const newScript = el.createEl("script");
+			newScript.setAttribute("type", "text/tikz");
+			newScript.setAttribute("data-show-console", "true");
+			newScript.setText(source);
+
+			this.watchForStuckRender(el, source);
+		});
+	}
+
+	async resetTikZJaxEngine(doc: Document) {
+		const win = doc.defaultView as any;
+
+		// Use the exposed cleanup function to terminate Worker and disconnect observer
+		if (typeof win?.__tikzjaxCleanup === 'function') {
+			try {
+				await win.__tikzjaxCleanup();
+			} catch (e) {
+				console.warn('TikZJax: cleanup failed', e);
+			}
+		}
+
+		// Remove old script element
+		doc.getElementById("tikzjax")?.remove();
+
+		// Clear tracked state so loadTikZJax will re-initialize
+		this.initializedDocs.delete(doc);
+
+		// Re-inject tikzjax.js with fresh Worker and MutationObserver
+		this.loadTikZJax(doc);
 	}
 
 
@@ -252,6 +313,7 @@ export default class TikzjaxPlugin extends Plugin {
 	postProcessSvg = (e: Event) => {
 
 		const svgEl = e.target as HTMLElement;
+		const container = svgEl.closest('[data-tikz-source]') as HTMLElement | null;
 		let svg = svgEl.outerHTML;
 
 		if (this.settings.invertColorsInDarkMode) {
@@ -261,6 +323,13 @@ export default class TikzjaxPlugin extends Plugin {
 		svg = this.optimizeSVG(svg);
 
 		svgEl.outerHTML = svg;
+
+		// Cache the processed SVG so future renders (e.g. PDF export) can
+		// reuse it immediately without waiting for the tikzjax Worker.
+		const source = container?.dataset.tikzSource;
+		if (source) {
+			this.svgCache.set(source, svg);
+		}
 	}
 }
 

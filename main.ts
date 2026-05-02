@@ -1,4 +1,4 @@
-import { Plugin, WorkspaceWindow } from 'obsidian';
+import { Plugin, WorkspaceWindow, TFile, MarkdownView } from 'obsidian';
 import { TikzjaxPluginSettings, DEFAULT_SETTINGS, TikzjaxSettingTab } from "./settings";
 import { optimize } from "./svgo.browser";
 
@@ -12,6 +12,11 @@ export default class TikzjaxPlugin extends Plugin {
 	private initializedDocs = new WeakSet<Document>();
 	private svgCache = new Map<string, string>();
 
+	// %!include file cache: vault path → content
+	private includeContentCache = new Map<string, string>();
+	// Reverse map for auto-refresh: included vault path → Set of source note paths
+	private includeMap = new Map<string, Set<string>>();
+
 	async onload() {
 		await this.loadSettings();
 		this.addSettingTab(new TikzjaxSettingTab(this.app, this));
@@ -24,9 +29,24 @@ export default class TikzjaxPlugin extends Plugin {
 			}));
 		});
 
+		// Auto-refresh notes when an included .tikz file is saved
+		this.registerEvent(this.app.vault.on('modify', (file) => {
+			if (!(file instanceof TFile)) { return; }
+			this.includeContentCache.delete(file.path);
+			const affectedNotes = this.includeMap.get(file.path);
+			if (!affectedNotes?.size) { return; }
+			for (const notePath of affectedNotes) {
+				for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+					const view = leaf.view as MarkdownView;
+					if ((view as any).file?.path === notePath) {
+						// @ts-ignore rerender is not typed in the public API
+						view.previewMode?.rerender(true);
+					}
+				}
+			}
+		}));
 
 		this.addSyntaxHighlighting();
-
 		this.registerTikzCodeBlock();
 	}
 
@@ -150,10 +170,13 @@ export default class TikzjaxPlugin extends Plugin {
 
 
 	registerTikzCodeBlock() {
-		this.registerMarkdownCodeBlockProcessor("tikz", (source, el, ctx) => {
+		this.registerMarkdownCodeBlockProcessor("tikz", async (source, el, ctx) => {
 			// Ensure TikZJax is loaded in the rendering document.
 			// This covers export/print contexts that use a separate document.
 			this.loadTikZJax(el.ownerDocument);
+
+			// Resolve %!include directive (load external .tikz file from vault)
+			source = await this.resolveInclude(source, ctx.sourcePath);
 
 			const tidiedSource = this.tidyTikzSource(source);
 
@@ -179,6 +202,50 @@ export default class TikzjaxPlugin extends Plugin {
 			// full engine reset (terminates Worker, re-injects tikzjax.js).
 			this.watchForStuckRender(el, tidiedSource);
 		});
+	}
+
+	/**
+	 * Resolve a %!include directive at the top of a tikz source block.
+	 *
+	 * Syntax (first non-empty line of the block):
+	 *   %!include path/to/diagram.tikz
+	 *
+	 * Path is relative to the source note's location in the vault.
+	 * File content is cached; the cache is invalidated automatically when
+	 * the vault fires a 'modify' event for the included file.
+	 */
+	async resolveInclude(source: string, sourcePath: string): Promise<string> {
+		const firstLine = source.trim().split('\n')[0]?.trim();
+		const match = firstLine?.match(/^%!include\s+(.+)$/);
+		if (!match) { return source; }
+
+		const includePath = match[1].trim();
+
+		// Resolve relative to the source note's vault directory
+		const noteDir = sourcePath.includes('/')
+			? sourcePath.substring(0, sourcePath.lastIndexOf('/'))
+			: '';
+		const vaultPath = noteDir ? `${noteDir}/${includePath}` : includePath;
+
+		// Track the dependency for auto-refresh on file save
+		if (!this.includeMap.has(vaultPath)) {
+			this.includeMap.set(vaultPath, new Set());
+		}
+		this.includeMap.get(vaultPath)!.add(sourcePath);
+
+		// Return cached content if available
+		const cached = this.includeContentCache.get(vaultPath);
+		if (cached !== undefined) { return cached; }
+
+		// Read from vault
+		const file = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (file instanceof TFile) {
+			const content = await this.app.vault.read(file);
+			this.includeContentCache.set(vaultPath, content);
+			return content;
+		}
+
+		return `% Error: cannot include ${includePath}`;
 	}
 
 	watchForStuckRender(el: HTMLElement, source: string) {
@@ -256,11 +323,8 @@ export default class TikzjaxPlugin extends Plugin {
 	}
 
 	tidyTikzSource(tikzSource: string) {
-
-		// Remove non-breaking space characters, otherwise we get errors
-		const remove = "&nbsp;";
-		tikzSource = tikzSource.replaceAll(remove, "");
-
+		// Remove non-breaking space characters (both HTML entity form and actual Unicode U+00A0)
+		tikzSource = tikzSource.replace(/ /g, ' ').replaceAll("&nbsp;", ' ');
 
 		let lines = tikzSource.split("\n");
 
@@ -270,18 +334,57 @@ export default class TikzjaxPlugin extends Plugin {
 		// Remove empty lines
 		lines = lines.filter(line => line);
 
-
 		return lines.join("\n");
 	}
 
 
 	colorSVGinDarkMode(svg: string) {
-		// Replace the color "black" with currentColor (the current text color)
-		// so that diagram axes, etc are visible in dark mode
-		// And replace "white" with the background color
+		// Replace black/white color values in both direct SVG attributes and inline style blocks.
+		const bgColor = 'var(--background-primary)';
 
-		svg = svg.replaceAll(/("#000"|"black")/g, `"currentColor"`)
-				.replaceAll(/("#fff"|"white")/g, `"var(--background-primary)"`);
+		const blackPatterns = ['#000000', '#000', 'black', 'rgb\\(0,\\s*0,\\s*0\\)'];
+		const whitePatterns = ['#ffffff', '#fff', 'white', 'rgb\\(255,\\s*255,\\s*255\\)'];
+		const colorAttrs = ['fill', 'stroke', 'color'];
+
+		const replaceColorAttrs = (input: string, patterns: string[], replacement: string): string => {
+			let out = input;
+			for (const attr of colorAttrs) {
+				for (const pattern of patterns) {
+					out = out.replace(new RegExp(`${attr}="${pattern}"`, 'gi'), `${attr}="${replacement}"`);
+					out = out.replace(new RegExp(`${attr}='${pattern}'`, 'gi'), `${attr}="${replacement}"`);
+				}
+			}
+			return out;
+		};
+
+		const replaceInlineStyleColors = (input: string, patterns: string[], replacement: string): string => {
+			let out = input;
+			for (const attr of colorAttrs) {
+				for (const pattern of patterns) {
+					out = out.replace(
+						new RegExp(`(${attr}\\s*:\\s*)${pattern}(\\s*;?)`, 'gi'),
+						`$1${replacement}$2`
+					);
+				}
+			}
+			return out;
+		};
+
+		svg = replaceColorAttrs(svg, blackPatterns, 'currentColor');
+		svg = replaceColorAttrs(svg, whitePatterns, bgColor);
+		svg = replaceInlineStyleColors(svg, blackPatterns, 'currentColor');
+		svg = replaceInlineStyleColors(svg, whitePatterns, bgColor);
+
+		// TikZJax text often relies on SVG's default black fill (no explicit fill attr).
+		// In dark mode, make those text nodes inherit the foreground color.
+		svg = svg.replace(/<text\b([^>]*)>/gi, (fullTag, attrs) => {
+			if (/\/\s*>$/.test(fullTag)) { return fullTag; }
+			if (/\bfill\s*=\s*(['"]).*?\1/i.test(attrs)) { return fullTag; }
+			if (/\bcolor\s*=\s*(['"]).*?\1/i.test(attrs)) { return fullTag; }
+			if (/\bstyle\s*=\s*(['"])[\s\S]*?\bfill\s*:/i.test(attrs)) { return fullTag; }
+			if (/\bstyle\s*=\s*(['"])[\s\S]*?\bcolor\s*:/i.test(attrs)) { return fullTag; }
+			return fullTag.replace(/>$/, ' fill="currentColor">');
+		});
 
 		return svg;
 	}
@@ -290,23 +393,48 @@ export default class TikzjaxPlugin extends Plugin {
 	optimizeSVG(svg: string) {
 		// Optimize the SVG using SVGO
 		// Fixes misaligned text nodes on mobile
-
-		return optimize(svg, {plugins:
-			[
-				{
-					name: 'preset-default',
-					params: {
-						overrides: {
-							// Don't use the "cleanupIDs" plugin
-							// To avoid problems with duplicate IDs ("a", "b", ...)
-							// when inlining multiple svgs with IDs
-							cleanupIDs: false
-						}
+		// @ts-ignore — svgo.browser return type doesn't expose .data in TS defs
+		return optimize(svg, { plugins: [
+			{
+				name: 'preset-default',
+				params: {
+					overrides: {
+						// Preserve IDs to avoid conflicts with multiple diagrams
+						cleanupIDs: false,
+						// Preserve viewBox for proper scaling
+						removeViewBox: false,
+						// Disable path optimizations that cause uneven stroke widths
+						// and jagged curves (empirically verified)
+						convertPathData: false,
+						mergePaths: false,
+						convertTransform: false,
+						convertShapeToPath: false,
 					}
 				}
-			]
+			}
 		// @ts-ignore
-		}).data;
+		]}).data;
+	}
+
+	/**
+	 * Fix SVG width/height to match the viewBox dimensions exactly.
+	 * tikzjax outputs width/height ~1.333x the viewBox (72/54 dpi ratio),
+	 * causing stroke widths to render at fractional CSS pixels (e.g. 0.8→1.067),
+	 * producing uneven borders and jagged curves.
+	 */
+	fixSvgDimensions(svg: string): string {
+		const viewBoxMatch = svg.match(/viewBox="([^"]+)"/);
+		if (!viewBoxMatch) { return svg; }
+
+		const parts = viewBoxMatch[1].trim().split(/\s+/);
+		if (parts.length !== 4) { return svg; }
+
+		const vbWidth = parts[2];
+		const vbHeight = parts[3];
+
+		let result = svg.replace(/(<svg[^>]*?\s)width="[^"]*"/, `$1width="${vbWidth}pt"`);
+		result = result.replace(/(<svg[^>]*?\s)height="[^"]*"/, `$1height="${vbHeight}pt"`);
+		return result;
 	}
 
 
@@ -315,6 +443,8 @@ export default class TikzjaxPlugin extends Plugin {
 		const svgEl = e.target as HTMLElement;
 		const container = svgEl.closest('[data-tikz-source]') as HTMLElement | null;
 		let svg = svgEl.outerHTML;
+
+		svg = this.fixSvgDimensions(svg);
 
 		if (this.settings.invertColorsInDarkMode) {
 			svg = this.colorSVGinDarkMode(svg);
@@ -332,4 +462,3 @@ export default class TikzjaxPlugin extends Plugin {
 		}
 	}
 }
-
